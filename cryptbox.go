@@ -11,8 +11,10 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"errors"
+	"hash/crc32"
 	"io"
 	"os"
+	"unsafe"
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/pbkdf2"
@@ -41,10 +43,19 @@ func (d *data) Write(p []byte) (n int, err error)
 type File struct {
 	Filename string
 	fd       *os.File
-
+	buff     data
 	// The unencrypted, raw file checksum
 	FileChecksum []byte
-	buff         data
+}
+
+// Len returns the files size on disk. In order to avoid passing an addition
+// return value, Len will return -1 in the event of an error.
+func (f *File) Len() int64 {
+	s, err := f.fd.Stat()
+	if err != nil {
+		return -1
+	}
+	return s.Size()
 }
 
 type Cryptboxer interface {
@@ -56,19 +67,22 @@ type Cryptboxer interface {
 type ArbitraryStorage struct {
 	Start   uintptr
 	End     uintptr
-	offsets []uint64
+	offsets map[[]byte]uint64 // maps filename to offset
 }
 
 // Cryptbox is an encryptable container of arbitrary files.
 type Cryptbox struct {
-	// map filename, to key:value pairs
-	Metadata map[string]map[string]string
+	// any additional metadata
+	Metadata map[string]string
 
 	Storage ArbitraryStorage
 }
 
-func (b *Cryptbox) AddFile(file *File) {
-
+func (b *Cryptbox) AddFile(file *File) error {
+	if filelength := file.Len(); filelength <= 0 {
+		return errors.New("unable to add file to cryptbox: invalid length")
+	}
+	// 	b.Storage.offsets[file.Filename] =
 }
 func OpenFileFromPath(path string) (*File, error) {
 	f, err := os.Open(path)
@@ -87,14 +101,33 @@ func OpenFileFromPath(path string) (*File, error) {
 
 		buff: fbuff,
 	}
-	//TODO: hash file.ReadWriter
 
+	//TODO: hash file.ReadWriter
+	n, err := io.ReadFull(f, file.buff)
+	if err != nil {
+		return nil, err
+	}
+	if n != file.Len() {
+		return nil, io.ErrShortWrite
+	}
+	file.FileChecksum = getcrc32(file)
 	return file, nil
 }
 
-func NewCryptbox() *Cryptbox {
-
+func getcrc32(f *File) uint32 {
+	newcrc := crc32.ChecksumIEEE(f.buff)
 }
+
+func NewCryptbox() *Cryptbox {
+	var storage = ArbitraryStorage{}
+	cbox := &Cryptbox{
+		Metadata: make(map[string]string),
+		Storage:  storage,
+	}
+	cbox.Storage.Start = uintptr(unsafe.Pointer(&cbox.Storage))
+	return &cbox
+}
+
 func (b *Cryptbox) Seal(password []byte, salt ...[]byte) error {
 	var storageLen int
 	for _, f := range b.Contents {
