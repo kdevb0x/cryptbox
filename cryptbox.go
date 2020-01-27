@@ -6,91 +6,131 @@
 package cryptbox
 
 import (
-	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha512"
-	"errors"
 	"io"
-	"os"
+	"io/ioutil"
+	"path/filepath"
 
 	"golang.org/x/crypto/bcrypt"
-	"golang.org/x/crypto/pbkdf2"
 	"golang.org/x/crypto/sha3"
-)
 
-var (
-	ErrFileIOError = errors.New("encountered critical error during file io operation")
+	"github.com/awnumar/memguard"
 )
-
-var SaveDir, _ = os.UserHomeDir()
 
 type Crypter interface {
 	Seal(password []byte, salt ...[]byte) error
 	Sealed() bool
 	Open(password []byte) error
-}
-
-// Cryptbox is an abstract object that stores sensitive files securely (for backup).
-type Cryptbox struct {
-	sums map[[64]byte]file // uses sha-3 SHAKE256 hash for keys
-
-	data uintptr
+	AddFile(path string) error
 }
 
 // file is a representation of a filesystem file, it contains the *os.File,
 // but also an internal buffer holding the  actual bytes that make up the file.
-type file struct {
+type File struct {
 	Filename string
-	Fd       *os.File
+	buff     []byte
 	Size     int64
-	Buff     *bytes.Buffer // uneeded ATM
+}
+
+// NewFileFromPath opens a file from disk, and creates a file we can use.
+func NewFileFromPath(path string) (*File, error) {
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	size := len(b)
+
+	_, file := filepath.Split(path)
+	f := &File{
+		Filename: file,
+		Size:     int64(size),
+		// Buff: *new(bytes.Buffer),
+		buff: b,
+	}
+	return f, nil
+}
+
+func (f *File) SHA3Hash() [64]byte {
+	var digest [64]byte
+	sha3.ShakeSum256(digest[:], f.buff)
+	return digest
+
+}
+
+type FileMetadata struct {
+	Hash   [64]byte
+	Offset int
+	F      *File
+}
+
+// Cryptbox is an abstract object that stores sensitive files securely (for backup).
+type Cryptbox struct {
+	Sums []FileMetadata // uses sha-3 SHAKE256 hash for keys
+
+	Data   *memguard.Enclave
+	pwhash []byte
+	sealed bool
 }
 
 func NewCryptBox() *Cryptbox {
-	// TODO: Create filedes and mmap() with posix_typed_mem_open(filepath string, os.O_RDWR, POSIX_TYPED_MEM_ALLOCATABLE)
-	// the goal is to use mmaped data for storage of encrypted data.
 
-	// data, err := unix.Creat(SaveDir, os.ModeExclusive)
-
-	return &Cryptbox{
-		sums: make(map[[64]byte]file),
-		data: 0,
+	var b *Cryptbox
+	b.Sums = make([]FileMetadata, 0)
+	var totSize int
+	for _, f := range b.Sums {
+		totSize += int(f.F.Size)
 	}
+	b.Data = memguard.NewEnclaveRandom(totSize)
+	return b
 }
 
-// openFromFilepath opens a file from disk, and creates a file we can use.
-func openFromFilepath(path string) (*file, error) {
-	f, err := os.Open(path)
+func (b *Cryptbox) AddFile(path string) error {
+
+	f, err := NewFileFromPath(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	size, err := f.Stat()
-	if err != nil {
-		return nil, err
+	hash := f.SHA3Hash()
+	meta := FileMetadata{
+		Hash: hash,
+		F:    f,
 	}
+	b.Sums = append(b.Sums, meta)
 
-	file := &file{
-		Filename: f.Name(),
-		Fd:       f,
-		Size:     size.Size(),
-		// Buff: *new(bytes.Buffer),
-	}
-	return file, nil
+	return nil
 }
 
-func AddFile(to Crypter, f *file) error {
-
-	// TODO: Finish implementing this.
-	// Currently we don't read the bytes from file underlying os.File
-	// untill we iterate throught the Metadat map, but we need a []byte in
-	// order to hash for the maps key, so kind of a chicken before egg issue.
-
-}
 func (b *Cryptbox) Seal(password []byte) error {
+	var c = make(chan error)
+
+	go func(c chan error) {
+
+		bf, err := b.Data.Open()
+		if err != nil {
+			c <- err
+		}
+		bf.Wipe()
+		if !bf.IsMutable() {
+			bf.Melt()
+		}
+		var lastoff = 0
+		for i, f := range b.Sums {
+			size := f.F.Size
+			b.Sums[i].Offset = lastoff
+
+			bf.Lock()
+			bf.MoveAt(lastoff, f.F.buff)
+			bf.Unlock()
+
+			lastoff += int(size) + 1
+		}
+		b.Data = bf.Seal()
+		close(c)
+	}(c)
+
 	// create random nonce
 	var nonce = make([]byte, 12)
+
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return err
 	}
@@ -98,83 +138,44 @@ func (b *Cryptbox) Seal(password []byte) error {
 	if err != nil {
 		return err
 	}
-	dk := pbkdf2.Key(key, nonce, 4096, 32, sha512.New)
+	b.pwhash = key
 
-	block, err := aes.NewCipher(dk)
+	// wait for goroutine; if it reports an error, return it
+	if err, isErr := <-c; isErr {
+		return err
+	}
+
+	// if we got here, gouroutine closed the chan and all is well.
+	b.sealed = true
+	return nil
+
+}
+
+func (b *Cryptbox) IsSealed() bool {
+	if b.Data.Size() > 0 && len(b.pwhash) > 0 {
+		if b.sealed {
+			return true
+		}
+	}
+	return false
+}
+
+/*
+// TODO: Finish implementing Open.
+
+func (b *Cryptbox) Open(password []byte) error {
+	if !b.IsSealed() {
+		return errors.New("error: failed to open; already open")
+	}
+	if err := bcrypt.CompareHashAndPassword(b.pwhash, password); err != nil {
+		return err
+	}
+	buff, err := b.Data.Open()
 	if err != nil {
 		return err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-	// pack each File contiguously
-
-	cipherReadWriter := gcm.Seal(nil, nonce, buff.Bytes(), nonce)
-
-	// append nonce to encrypted data
-	cipherReadWriter = append(cipherReadWriter, nonce...)
+	b.sealed = false
+	return nil
 
 }
-
-// packFileByteSlice mimics packFileBuffs but returns a []byte, not bytes.Buffer.
-func (b *Cryptbox) packFileByteSlice() ([]byte, error) {
-	var totalLen int64
-	for _, t := range b.sums {
-		totalLen += t.Size
-	}
-	var tmpb = make([]byte, totalLen)
-	// mainbuff := bytes.NewBuffer(tmpb)
-	var last int
-	for _, tb := range b.sums {
-		// n, err := io.Copy(mainbuff, tb.Fd)
-		// if err != nil {
-		// 	return ErrFileIOError
-		// }
-		// totalLen -= n
-		n, err := io.ReadFull(tb.Fd, tmpb[last:tb.Size])
-		if err != nil {
-			if e := err.(error); e == io.ErrUnexpectedEOF {
-				// tb.Fd.Read(tmpb[last:tb.Size])
-				return nil, e
-			}
-			return nil, err
-		}
-		last += n
-		tb.Fd.Close()
-
-	}
-	if last != len(tmpb) {
-		return nil, ErrFileIOError
-	}
-	return tmpb, nil
-
-}
-
-// packFileBuffs appends the bytes from each file to the unencrypted buffer,
-// making sure to clone each Fd in turn.
-func (b *Cryptbox) packFileBuffs() (*bytes.Buffer, error) {
-	var totalLen int64
-	for _, t := range b.sums {
-		totalLen += t.Size
-	}
-	var tmpb = make([]byte, totalLen)
-	mainbuff := bytes.NewBuffer(tmpb)
-	for _, tb := range b.sums {
-		n, err := io.Copy(mainbuff, tb.Fd)
-		if err != nil {
-			return nil, ErrFileIOError
-		}
-		totalLen -= n
-		tb.Fd.Close()
-	}
-	if totalLen != 0 {
-		return nil, ErrFileIOError
-	}
-	return mainbuff, nil
-}
-
-func getSHA3Hash(f *file) [64]byte {
-	h := sha3.NewShake256()
-
-}
+*/
